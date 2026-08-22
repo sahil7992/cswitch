@@ -1,0 +1,8 @@
+# local state, never commit
+slots/
+state.json
+usage-cache.json
+backup-*.json
+cswitch.log
+*.bak-*
+.DS_Store

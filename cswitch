@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""cswitch - rotate Claude Code between saved accounts by remaining quota.
+
+Swaps only claudeAiOauth in the keychain blob; mcpOAuth (MCP server logins)
+is left untouched. Writes the live token back to its slot on every swap so
+rotated refresh tokens never go stale.
+"""
+import json, os, re, subprocess, sys, time, getpass
+
+SERVICE   = "Claude Code-credentials"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+ROOT      = os.path.expanduser("~/.claude/router")
+SLOTS     = os.path.join(ROOT, "slots")
+STATE     = os.path.join(ROOT, "state.json")
+UCACHE    = os.path.join(ROOT, "usage-cache.json")
+LOG       = os.path.join(ROOT, "cswitch.log")
+CFG_JSON  = os.path.expanduser("~/.claude.json")
+DEFAULTS  = {"threshold": 90, "margin": 5, "cache_ttl": 90}
+
+
+def log(msg):
+    with open(LOG, "a") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+
+
+def ua():
+    try:
+        v = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=10).stdout
+        return "claude-code/" + re.search(r"(\d+\.\d+\.\d+)", v).group(1)
+    except Exception:
+        return "claude-code/2.1.239"
+
+
+# ---------- http (curl: this machine's python has no CA bundle) ----------
+def http(url, headers, body=None, timeout=20):
+    cmd = ["curl", "-sS", "--max-time", str(timeout), "-w", "\n__ST__%{http_code}", url]
+    for k, v in headers.items():
+        cmd += ["-H", f"{k}: {v}"]
+    if body is not None:
+        cmd += ["-X", "POST", "-d", "@-"]
+    r = subprocess.run(cmd, input=body, capture_output=True, text=True)
+    out = r.stdout
+    if "__ST__" not in out:
+        raise RuntimeError(f"curl failed: {r.stderr.strip()[:200]}")
+    payload, _, code = out.rpartition("\n__ST__")
+    try:
+        parsed = json.loads(payload) if payload.strip() else {}
+    except Exception:
+        parsed = {"_raw": payload[:300]}
+    return int(code), parsed
+
+
+def api(path, token):
+    return http("https://api.anthropic.com" + path, {
+        "Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": ua(), "Accept": "application/json"})
+
+
+# ---------- keychain ----------
+def kc_acct():
+    r = subprocess.run(["security", "find-generic-password", "-s", SERVICE],
+                       capture_output=True, text=True)
+    m = re.search(r'"acct"<blob>="([^"]*)"', r.stdout + r.stderr)
+    return m.group(1) if m else getpass.getuser()
+
+
+def kc_read():
+    r = subprocess.run(["security", "find-generic-password", "-s", SERVICE, "-w"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        die("no Claude Code credentials in keychain - run /login first")
+    return json.loads(r.stdout.strip())
+
+
+def kc_write(blob):
+    s = json.dumps(blob, separators=(",", ":"))
+    assert "\n" not in s
+    p = subprocess.run(["security", "add-generic-password", "-U", "-s", SERVICE,
+                        "-a", kc_acct(), "-w"], input=f"{s}\n{s}\n",
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        die(f"keychain write failed: {p.stderr.strip()[:200]}")
+    if json.dumps(kc_read(), separators=(",", ":")) != s:   # verify roundtrip
+        die("keychain readback mismatch - aborting")
+
+
+# ---------- state / slots ----------
+def load(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {} if default is None else default
+
+
+def save(path, obj, mode=0o600):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=1)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def state():
+    s = load(STATE); [s.setdefault(k, v) for k, v in DEFAULTS.items()]; return s
+
+
+def slot_path(n): return os.path.join(SLOTS, f"{n}.json")
+def slot_names(): return sorted(f[:-5] for f in os.listdir(SLOTS) if f.endswith(".json"))
+def die(m): print(f"cswitch: {m}", file=sys.stderr); sys.exit(1)
+
+
+def ensure_fresh(slot, name):
+    """Refresh the slot's access token if expired. Keeps the 29-day refresh
+    window alive for idle accounts, so you never re-authorize."""
+    o = slot["claudeAiOauth"]
+    if o.get("expiresAt", 0) > (time.time() + 300) * 1000:
+        return slot, False
+    code, d = http("https://api.anthropic.com/v1/oauth/token",
+                   {"Content-Type": "application/json", "User-Agent": ua()},
+                   json.dumps({"grant_type": "refresh_token",
+                               "refresh_token": o["refreshToken"],
+                               "client_id": CLIENT_ID}))
+    if code != 200 or "access_token" not in d:
+        log(f"refresh FAILED {name}: {code} {json.dumps(d)[:160]}")
+        return slot, False
+    o["accessToken"] = d["access_token"]
+    if d.get("refresh_token"): o["refreshToken"] = d["refresh_token"]
+    if d.get("expires_in"):    o["expiresAt"] = int((time.time() + d["expires_in"]) * 1000)
+    save(slot_path(name), slot); log(f"refreshed token for {name}")
+    return slot, True
+
+
+def quota(name, slot):
+    """(worst_utilization, detail) for a slot. None if unreachable."""
+    slot, _ = ensure_fresh(slot, name)
+    code, d = api("/api/oauth/usage", slot["claudeAiOauth"]["accessToken"])
+    if code != 200:
+        return None, {"error": f"HTTP {code}"}
+    w = {k: (d.get(k) or {}).get("utilization") for k in ("five_hour", "seven_day")}
+    vals = [v for v in w.values() if isinstance(v, (int, float))]
+    return (max(vals) if vals else None), {
+        "five_hour": w["five_hour"], "seven_day": w["seven_day"],
+        "resets_5h": (d.get("five_hour") or {}).get("resets_at"),
+        "resets_7d": (d.get("seven_day") or {}).get("resets_at")}
+
+
+# ---------- commands ----------
+def cmd_add(name):
+    if not name: die("usage: cswitch add <name>")
+    live = kc_read()
+    o = live.get("claudeAiOauth") or die("no claudeAiOauth in keychain")
+    code, prof = api("/api/oauth/profile", o["accessToken"])
+    if code != 200: die(f"profile lookup failed (HTTP {code}) - is this account logged in?")
+    acct = prof.get("account", {}); org = prof.get("organization", {})
+    for other in slot_names():
+        if other != name and load(slot_path(other)).get("uuid") == acct.get("uuid"):
+            print(f"note: same account already saved as '{other}'")
+    save(slot_path(name), {
+        "claudeAiOauth": o,
+        "oauthAccount": load(CFG_JSON).get("oauthAccount", {}),
+        "userID": load(CFG_JSON).get("userID"),
+        "email": acct.get("email"), "uuid": acct.get("uuid"),
+        "org": org.get("name"), "saved_at": int(time.time())})
+    s = state(); s["active"] = name; save(STATE, s)
+    print(f"saved slot '{name}' -> {acct.get('email')} ({org.get('name')})")
+    print(f"active: {name}")
+
+
+def cmd_ls(_=None):
+    st = state(); names = slot_names()
+    if not names: die("no slots yet - run: cswitch add <name>")
+    print(f"{'':2}{'slot':<12}{'account':<42}{'5h':>6}{'7d':>6}   resets(7d)")
+    for n in names:
+        sl = load(slot_path(n)); u, d = quota(n, sl)
+        mark = "*" if st.get("active") == n else " "
+        if u is None:
+            print(f"{mark} {n:<12}{(sl.get('email') or '?'):<42}{'  ?':>6}{'  ?':>6}   {d.get('error','')}")
+        else:
+            r = (d.get("resets_7d") or "")[:16].replace("T", " ")
+            print(f"{mark} {n:<12}{(sl.get('email') or '?'):<42}{d['five_hour']:>5.0f}%{d['seven_day']:>5.0f}%   {r}")
+    print(f"\nthreshold {st['threshold']}%  |  * = active")
+
+
+def cmd_use(name, quiet=False):
+    if not name: die("usage: cswitch use <name>")
+    if not os.path.exists(slot_path(name)): die(f"no such slot: {name}")
+    st = state()
+    if st.get("active") == name and not quiet:
+        print(f"already on '{name}'"); return
+    live = kc_read()
+    prev = st.get("active")
+    if prev and os.path.exists(slot_path(prev)):          # capture rotated tokens
+        p = load(slot_path(prev)); cfg = load(CFG_JSON)
+        p["claudeAiOauth"] = live.get("claudeAiOauth", p.get("claudeAiOauth"))
+        p["oauthAccount"] = cfg.get("oauthAccount", p.get("oauthAccount"))
+        p["userID"] = cfg.get("userID", p.get("userID"))
+        save(slot_path(prev), p)
+    tgt, _ = ensure_fresh(load(slot_path(name)), name)
+    save(os.path.join(ROOT, f"backup-{int(time.time())}.json"), live)
+    live["claudeAiOauth"] = tgt["claudeAiOauth"]           # mcpOAuth preserved
+    kc_write(live)
+    cfg = load(CFG_JSON)
+    if tgt.get("oauthAccount"): cfg["oauthAccount"] = tgt["oauthAccount"]
+    if tgt.get("userID"):       cfg["userID"] = tgt["userID"]
+    cfg.pop("cachedUsageUtilization", None)               # belongs to the old account
+    save(CFG_JSON, cfg, mode=0o644)
+    st["active"] = name; st["last_swap"] = int(time.time()); save(STATE, st)
+    try: os.remove(UCACHE)
+    except OSError: pass
+    log(f"swap {prev} -> {name}")
+    if not quiet:
+        print(f"switched: {prev} -> {name} ({tgt.get('email')})")
+        print("takes effect on your next message (keychain cache ~30s)")
+
+
+def cmd_sync(_=None):
+    """Write the live token back to its slot without switching."""
+    st = state(); a = st.get("active")
+    if not a or not os.path.exists(slot_path(a)): die("no active slot")
+    live = kc_read(); cfg = load(CFG_JSON); sl = load(slot_path(a))
+    sl["claudeAiOauth"] = live.get("claudeAiOauth", sl.get("claudeAiOauth"))
+    sl["oauthAccount"] = cfg.get("oauthAccount", sl.get("oauthAccount"))
+    save(slot_path(a), sl); print(f"synced '{a}'")
+
+
+def pick(st):
+    """(best_name, best_util, active_util) by most quota left."""
+    scores = {}
+    for n in slot_names():
+        u, _ = quota(n, load(slot_path(n)))
+        if u is not None: scores[n] = u
+    if not scores: return None, None, None
+    best = min(scores, key=scores.get)
+    return best, scores[best], scores.get(st.get("active"))
+
+
+def cmd_auto(_=None, quiet=False):
+    st = state(); a = st.get("active")
+    best, bu, au = pick(st)
+    if best is None:
+        if not quiet: print("no reachable slots")
+        return False
+    if au is not None and au < st["threshold"]:
+        if not quiet: print(f"'{a}' at {au:.0f}% - under {st['threshold']}%, staying")
+        return False
+    if best == a or bu >= (au or 100) - st["margin"]:
+        if not quiet: print(f"no better account (best '{best}' at {bu:.0f}%)")
+        return False
+    cmd_use(best, quiet=True)
+    msg = f"account rotated: {a} ({au:.0f}% used) -> {best} ({bu:.0f}% used)"
+    log(msg)
+    if not quiet: print(msg)
+    else: print(f"[cswitch] {msg}. Effective from your next message.")
+    return True
+
+
+SETTINGS  = os.path.expanduser("~/.claude/settings.json")
+HOOK_CMD  = "~/.claude/router/cswitch hook"
+
+
+def hook_install(remove=False):
+    """Register (or drop) the UserPromptSubmit hook in Claude Code settings."""
+    cfg = load(SETTINGS, {})
+    ups = cfg.setdefault("hooks", {}).setdefault("UserPromptSubmit", [])
+    present = any(h.get("command") == HOOK_CMD for e in ups for h in e.get("hooks", []))
+    if remove:
+        if not present: print("hook not installed"); return
+        for e in ups: e["hooks"] = [h for h in e.get("hooks", []) if h.get("command") != HOOK_CMD]
+        cfg["hooks"]["UserPromptSubmit"] = [e for e in ups if e.get("hooks")]
+        save(SETTINGS, cfg, mode=0o600); print("hook removed"); return
+    if present: print("hook already installed"); return
+    # synchronous on purpose: the swap must land before the request goes out
+    ups.append({"hooks": [{"type": "command", "command": HOOK_CMD, "timeout": 8}]})
+    save(SETTINGS, cfg, mode=0o600)
+    print("hook installed - cswitch will rotate automatically at the threshold")
+
+
+def cmd_hook(arg=None):
+    """UserPromptSubmit: silent unless it swaps. Never blocks the prompt."""
+    if arg == "install":   return hook_install()
+    if arg == "uninstall": return hook_install(remove=True)
+    try:
+        st = state(); a = st.get("active")
+        if not a or len(slot_names()) < 2: return
+        c = load(UCACHE)
+        if c.get("name") == a and time.time() - c.get("at", 0) < st["cache_ttl"]:
+            u = c.get("util")
+        else:
+            u, _ = quota(a, load(slot_path(a)))
+            save(UCACHE, {"name": a, "util": u, "at": time.time()})
+        if u is None or u < st["threshold"]: return
+        cmd_auto(quiet=True)
+    except Exception as e:
+        log(f"hook error: {type(e).__name__}: {e}")
+
+
+def cmd_whoami(_=None):
+    st = state(); a = st.get("active")
+    sl = load(slot_path(a)) if a else {}
+    u, d = quota(a, sl) if sl else (None, {})
+    print(f"{a}  {sl.get('email','?')}  ({sl.get('org','?')})")
+    if u is not None: print(f"5h {d['five_hour']:.0f}%   7d {d['seven_day']:.0f}%")
+
+
+def cmd_set(arg):
+    st = state()
+    k, _, v = (arg or "").partition("=")
+    if k not in DEFAULTS: die(f"settable: {', '.join(DEFAULTS)}")
+    st[k] = int(v); save(STATE, st); print(f"{k} = {st[k]}")
+
+
+CMDS = {"add": cmd_add, "ls": cmd_ls, "list": cmd_ls, "use": cmd_use, "switch": cmd_use,
+        "auto": cmd_auto, "sync": cmd_sync, "hook": cmd_hook, "whoami": cmd_whoami, "set": cmd_set}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__)
+        print("commands: " + "  ".join(sorted(set(k for k in CMDS))))
+        sys.exit(0)
+    fn = CMDS.get(sys.argv[1]) or die(f"unknown command: {sys.argv[1]}")
+    fn(sys.argv[2] if len(sys.argv) > 2 else None)
