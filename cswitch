@@ -72,16 +72,30 @@ def kc_read():
     return json.loads(r.stdout.strip())
 
 
+def kc_raw():
+    return subprocess.run(["security", "find-generic-password", "-s", SERVICE, "-w"],
+                          capture_output=True, text=True).stdout.strip()
+
+
+def kc_put(s):
+    """Same route Claude Code uses: `security -i` on stdin, argv when the line is too
+    long. Piping into the -w prompt instead keeps only the first 128 characters."""
+    h = s.encode().hex()
+    cmd = f'add-generic-password -U -a "{kc_acct()}" -s "{SERVICE}" -X "{h}"'
+    if len(cmd) < 4000:                                     # security -i splits longer lines
+        return subprocess.run(["security", "-i"], input=cmd + "\n", capture_output=True, text=True)
+    return subprocess.run(["security", "add-generic-password", "-U", "-a", kc_acct(),
+                           "-s", SERVICE, "-X", h], capture_output=True, text=True)
+
+
 def kc_write(blob):
+    old = kc_raw()
     s = json.dumps(blob, separators=(",", ":"))
-    assert "\n" not in s
-    p = subprocess.run(["security", "add-generic-password", "-U", "-s", SERVICE,
-                        "-a", kc_acct(), "-w"], input=f"{s}\n{s}\n",
-                       capture_output=True, text=True)
-    if p.returncode != 0:
-        die(f"keychain write failed: {p.stderr.strip()[:200]}")
-    if json.dumps(kc_read(), separators=(",", ":")) != s:   # verify roundtrip
-        die("keychain readback mismatch - aborting")
+    p = kc_put(s)
+    if p.returncode == 0 and kc_raw() == s:                # verify roundtrip
+        return
+    kc_put(old)                                             # put the previous login back
+    die(f"keychain write failed, previous login restored: {p.stderr.strip()[:200]}")
 
 
 # ---------- state / slots ----------

@@ -137,9 +137,12 @@ Saved tokens live in `~/.claude/router/slots/`, written `0600` inside a `0700`
 directory. Nothing in that directory is tracked by git, and `.gitignore` is set up
 so a careless `git add` cannot pick it up.
 
-Keychain writes go over stdin rather than through argv, so your token never appears
-in the process list. Every write is read back and compared before it is trusted, and
-the previous blob is backed up first.
+Keychain writes take the same route Claude Code itself uses: the login goes to
+`security -i` over stdin, so it stays out of the process list, unless it is too long
+for one stdin line (about 4 KB), in which case it is passed as an argument for the
+moment the write runs. Every write is read back and compared before it is trusted,
+the previous blob is backed up first, and a write that does not read back intact is
+undone by putting the previous login back.
 
 If you use a company account, note that its token sits in that directory like any
 other. Treat the machine accordingly.
