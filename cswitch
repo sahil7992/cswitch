@@ -15,7 +15,7 @@ STATE     = os.path.join(ROOT, "state.json")
 UCACHE    = os.path.join(ROOT, "usage-cache.json")
 LOG       = os.path.join(ROOT, "cswitch.log")
 CFG_JSON  = os.path.expanduser("~/.claude.json")
-DEFAULTS  = {"threshold": 90, "margin": 5, "cache_ttl": 90}
+DEFAULTS  = {"threshold": 90, "cache_ttl": 90}
 
 
 def log(msg):
@@ -235,31 +235,36 @@ def cmd_sync(_=None):
     save(slot_path(a), sl); print(f"synced '{a}'")
 
 
-def pick(a):
-    """(best_name, best_util, active_util) by most quota left."""
-    scores = {}
+def pick(a, th):
+    """Other account with the lowest weekly use, then the lowest 5h use; ties go
+    to the first in slot order. Accounts at the threshold on either are skipped."""
+    cands = []
     for n in slot_names():
-        u, _ = quota(n, load(slot_path(n)))
-        if u is not None: scores[n] = u
-    if not scores: return None, None, None
-    best = min(scores, key=scores.get)
-    return best, scores[best], scores.get(a)
+        if n == a: continue
+        u, d = quota(n, load(slot_path(n)))
+        if u is None or u >= th: continue
+        cands.append((d["seven_day"] or 0, d["five_hour"] or 0, n))
+    if not cands: return None, None
+    w, h, n = min(cands, key=lambda c: c[:2])               # min keeps the first on a tie
+    return n, {"seven_day": w, "five_hour": h}
 
 
 def cmd_auto(_=None, quiet=False):
-    st = state(); a = live_slot()
-    best, bu, au = pick(a)
+    st = state(); a = live_slot(); th = st["threshold"]
+    if not a: no_slot()
+    au, _ = quota(a, load(slot_path(a)))
+    if au is None:
+        if not quiet: print(f"cannot read usage for '{a}' - staying")
+        return False
+    if au < th:
+        if not quiet: print(f"'{a}' at {au:.0f}% - under {th}%, staying")
+        return False
+    best, d = pick(a, th)
     if best is None:
-        if not quiet: print("no reachable slots")
-        return False
-    if au is not None and au < st["threshold"]:
-        if not quiet: print(f"'{a}' at {au:.0f}% - under {st['threshold']}%, staying")
-        return False
-    if best == a or bu >= (au or 100) - st["margin"]:
-        if not quiet: print(f"no better account (best '{best}' at {bu:.0f}%)")
+        if not quiet: print(f"every other account is at {th}% or more - staying on '{a}'")
         return False
     cmd_use(best, quiet=True)
-    msg = f"account rotated: {a} ({au:.0f}% used) -> {best} ({bu:.0f}% used)"
+    msg = f"account rotated: {a} ({au:.0f}% used) -> {best} (weekly {d['seven_day']:.0f}%, session {d['five_hour']:.0f}%)"
     log(msg)
     if not quiet: print(msg)
     else: print(f"[cswitch] {msg}. Effective from your next message.")
