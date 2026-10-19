@@ -142,7 +142,10 @@ def ensure_fresh(slot, name):
 
 def quota(name, slot):
     """(worst_utilization, detail) for a slot. None if unreachable."""
-    slot, _ = ensure_fresh(slot, name)
+    if name == live_slot():   # Claude Code rotates the live token itself; the slot copy goes stale
+        slot["claudeAiOauth"] = kc_read()["claudeAiOauth"]; save(slot_path(name), slot)
+    else:
+        slot, _ = ensure_fresh(slot, name)
     code, d = api("/api/oauth/usage", slot["claudeAiOauth"]["accessToken"])
     if code != 200:
         return None, {"error": f"HTTP {code}"}
