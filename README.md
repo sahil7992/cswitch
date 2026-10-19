@@ -85,7 +85,9 @@ Three details do the real work:
 
 **Tokens are written back before every swap.** Refresh tokens rotate on use. A
 switcher that restores an old snapshot restores a dead token, and you are back to
-clicking authorize. `cswitch` captures the live token into its slot on the way out.
+clicking authorize. `cswitch` captures the live token on the way out, into the slot
+of whichever account is actually signed in, so a `/login` behind its back cannot
+cross-wire two slots.
 
 **Idle accounts get refreshed.** Refresh tokens expire about 29 days after issue.
 The account you are not using would quietly die. `cswitch` renews it whenever it

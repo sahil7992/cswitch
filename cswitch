@@ -108,6 +108,15 @@ def state():
 def slot_path(n): return os.path.join(SLOTS, f"{n}.json")
 def slot_names(): return sorted(f[:-5] for f in os.listdir(SLOTS) if f.endswith(".json"))
 def die(m): print(f"cswitch: {m}", file=sys.stderr); sys.exit(1)
+def live_acct(): return load(CFG_JSON).get("oauthAccount", {})
+def no_slot(): die(f"signed in as {live_acct().get('emailAddress')}, which has no slot - run: cswitch add <name>")
+
+
+def live_slot():
+    """Slot of the account Claude Code is signed in as now, or None. /login can
+    change accounts behind cswitch's back, so state['active'] is not trusted."""
+    u = live_acct().get("accountUuid")
+    return next((n for n in slot_names() if u and load(slot_path(n)).get("uuid") == u), None)
 
 
 def ensure_fresh(slot, name):
@@ -168,12 +177,12 @@ def cmd_add(name):
 
 
 def cmd_ls(_=None):
-    st = state(); names = slot_names()
+    st = state(); names = slot_names(); live = live_slot()
     if not names: die("no slots yet - run: cswitch add <name>")
     print(f"{'':2}{'slot':<12}{'account':<42}{'5h':>6}{'7d':>6}   resets(7d)")
     for n in names:
         sl = load(slot_path(n)); u, d = quota(n, sl)
-        mark = "*" if st.get("active") == n else " "
+        mark = "*" if live == n else " "
         if u is None:
             print(f"{mark} {n:<12}{(sl.get('email') or '?'):<42}{'  ?':>6}{'  ?':>6}   {d.get('error','')}")
         else:
@@ -185,17 +194,16 @@ def cmd_ls(_=None):
 def cmd_use(name, quiet=False):
     if not name: die("usage: cswitch use <name>")
     if not os.path.exists(slot_path(name)): die(f"no such slot: {name}")
-    st = state()
-    if st.get("active") == name and not quiet:
+    st = state(); prev = live_slot()
+    if prev is None: no_slot()                             # never overwrite an unsaved login
+    if prev == name and not quiet:
         print(f"already on '{name}'"); return
     live = kc_read()
-    prev = st.get("active")
-    if prev and os.path.exists(slot_path(prev)):          # capture rotated tokens
-        p = load(slot_path(prev)); cfg = load(CFG_JSON)
-        p["claudeAiOauth"] = live.get("claudeAiOauth", p.get("claudeAiOauth"))
-        p["oauthAccount"] = cfg.get("oauthAccount", p.get("oauthAccount"))
-        p["userID"] = cfg.get("userID", p.get("userID"))
-        save(slot_path(prev), p)
+    p = load(slot_path(prev)); cfg = load(CFG_JSON)        # capture rotated tokens
+    p["claudeAiOauth"] = live.get("claudeAiOauth", p.get("claudeAiOauth"))
+    p["oauthAccount"] = cfg.get("oauthAccount", p.get("oauthAccount"))
+    p["userID"] = cfg.get("userID", p.get("userID"))
+    save(slot_path(prev), p)
     tgt, _ = ensure_fresh(load(slot_path(name)), name)
     save(os.path.join(ROOT, f"backup-{int(time.time())}.json"), live)
     live["claudeAiOauth"] = tgt["claudeAiOauth"]           # mcpOAuth preserved
@@ -216,15 +224,15 @@ def cmd_use(name, quiet=False):
 
 def cmd_sync(_=None):
     """Write the live token back to its slot without switching."""
-    st = state(); a = st.get("active")
-    if not a or not os.path.exists(slot_path(a)): die("no active slot")
+    a = live_slot()
+    if not a: no_slot()
     live = kc_read(); cfg = load(CFG_JSON); sl = load(slot_path(a))
     sl["claudeAiOauth"] = live.get("claudeAiOauth", sl.get("claudeAiOauth"))
     sl["oauthAccount"] = cfg.get("oauthAccount", sl.get("oauthAccount"))
     save(slot_path(a), sl); print(f"synced '{a}'")
 
 
-def pick(st):
+def pick(a):
     """(best_name, best_util, active_util) by most quota left."""
     scores = {}
     for n in slot_names():
@@ -232,12 +240,12 @@ def pick(st):
         if u is not None: scores[n] = u
     if not scores: return None, None, None
     best = min(scores, key=scores.get)
-    return best, scores[best], scores.get(st.get("active"))
+    return best, scores[best], scores.get(a)
 
 
 def cmd_auto(_=None, quiet=False):
-    st = state(); a = st.get("active")
-    best, bu, au = pick(st)
+    st = state(); a = live_slot()
+    best, bu, au = pick(a)
     if best is None:
         if not quiet: print("no reachable slots")
         return False
@@ -281,7 +289,7 @@ def cmd_hook(arg=None):
     if arg == "install":   return hook_install()
     if arg == "uninstall": return hook_install(remove=True)
     try:
-        st = state(); a = st.get("active")
+        st = state(); a = live_slot()
         if not a or len(slot_names()) < 2: return
         c = load(UCACHE)
         if c.get("name") == a and time.time() - c.get("at", 0) < st["cache_ttl"]:
@@ -296,9 +304,10 @@ def cmd_hook(arg=None):
 
 
 def cmd_whoami(_=None):
-    st = state(); a = st.get("active")
-    sl = load(slot_path(a)) if a else {}
-    u, d = quota(a, sl) if sl else (None, {})
+    a = live_slot()
+    if not a: no_slot()
+    sl = load(slot_path(a))
+    u, d = quota(a, sl)
     print(f"{a}  {sl.get('email','?')}  ({sl.get('org','?')})")
     if u is not None: print(f"5h {d['five_hour']:.0f}%   7d {d['seven_day']:.0f}%")
 
