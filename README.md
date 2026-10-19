@@ -90,8 +90,9 @@ of whichever account is actually signed in, so a `/login` behind its back cannot
 cross-wire two slots.
 
 **Idle accounts get refreshed.** Refresh tokens expire about 29 days after issue.
-The account you are not using would quietly die. `cswitch` renews it whenever it
-reads that account's quota, so both slots stay valid indefinitely.
+The account you are not using would quietly die. `cswitch` renews every unused
+account once a day from the hook, and whenever it reads that account's quota, so
+every slot stays valid indefinitely.
 
 **MCP logins survive.** The keychain blob holds your MCP server OAuth next to your
 Claude login. Only the Claude half is replaced.

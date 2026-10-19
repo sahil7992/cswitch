@@ -294,6 +294,10 @@ def cmd_hook(arg=None):
     try:
         st = state(); a = live_slot()
         if not a or len(slot_names()) < 2: return
+        if time.time() - st.get("keepalive", 0) > 86400:   # idle refresh tokens die after ~29 days
+            for n in slot_names():
+                if n != a: ensure_fresh(load(slot_path(n)), n)
+            st["keepalive"] = int(time.time()); save(STATE, st)
         c = load(UCACHE)
         if c.get("name") == a and time.time() - c.get("at", 0) < st["cache_ttl"]:
             u = c.get("util")
