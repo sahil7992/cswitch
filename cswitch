@@ -5,7 +5,7 @@ Swaps only claudeAiOauth in the keychain blob; mcpOAuth (MCP server logins)
 is left untouched. Writes the live token back to its slot on every swap so
 rotated refresh tokens never go stale.
 """
-import json, os, re, subprocess, sys, time, getpass
+import fcntl, json, os, re, subprocess, sys, time, getpass
 
 SERVICE   = "Claude Code-credentials"
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -14,6 +14,7 @@ SLOTS     = os.path.join(ROOT, "slots")
 STATE     = os.path.join(ROOT, "state.json")
 UCACHE    = os.path.join(ROOT, "usage-cache.json")
 LOG       = os.path.join(ROOT, "cswitch.log")
+LOCK      = os.path.join(ROOT, ".lock")
 CFG_JSON  = os.path.expanduser("~/.claude.json")
 DEFAULTS  = {"threshold": 90, "cache_ttl": 90}
 
@@ -311,6 +312,7 @@ def cmd_hook(arg=None):
     if arg == "install":   return hook_install()
     if arg == "uninstall": return hook_install(remove=True)
     try:
+        lk = open(LOCK, "w"); fcntl.flock(lk, fcntl.LOCK_EX)   # sessions prompting together must not swap or refresh twice
         st = state(); a = live_slot()
         if not a or len(slot_names()) < 2: return
         if time.time() - st.get("keepalive", 0) > 86400:   # idle refresh tokens die after ~29 days
