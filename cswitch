@@ -197,15 +197,16 @@ def cmd_add(name):
 def cmd_ls(_=None):
     st = state(); names = slot_names(); live = live_slot()
     if not names: die("no slots yet - run: cswitch add <name>")
-    print(f"{'':2}{'slot':<12}{'account':<42}{'5h':>6}{'7d':>6}   resets(7d)")
+    w = max(12, max(len(n) for n in names) + 2)
+    print(f"{'':2}{'slot':<{w}}{'account':<42}{'5h':>6}{'7d':>6}   resets(7d)")
     for n in names:
         sl = load(slot_path(n)); u, d = quota(n, sl)
         mark = "*" if live == n else " "
         if u is None:
-            print(f"{mark} {n:<12}{(sl.get('email') or '?'):<42}{'  ?':>6}{'  ?':>6}   {d.get('error','')}")
+            print(f"{mark} {n:<{w}}{(sl.get('email') or '?'):<42}{'  ?':>6}{'  ?':>6}   {d.get('error','')}")
         else:
             r = (d.get("resets_7d") or "")[:16].replace("T", " ")
-            print(f"{mark} {n:<12}{(sl.get('email') or '?'):<42}{d['five_hour']:>5.0f}%{d['seven_day']:>5.0f}%   {r}")
+            print(f"{mark} {n:<{w}}{(sl.get('email') or '?'):<42}{d['five_hour']:>5.0f}%{d['seven_day']:>5.0f}%   {r}")
     print(f"\nthreshold {st['threshold']}%  |  * = active")
 
 
