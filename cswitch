@@ -315,7 +315,11 @@ def cmd_hook(arg=None):
     try:
         lk = open(LOCK, "w"); fcntl.flock(lk, fcntl.LOCK_EX)   # sessions prompting together must not swap or refresh twice
         st = state(); a = live_slot()
-        if not a or len(slot_names()) < 2: return
+        if not a: return
+        live, sl = kc_read().get("claudeAiOauth"), load(slot_path(a))
+        if live and sl.get("claudeAiOauth") != live:   # Claude Code rotates the live token; a /login elsewhere would lose it
+            sl["claudeAiOauth"] = live; save(slot_path(a), sl)
+        if len(slot_names()) < 2: return
         if time.time() - st.get("keepalive", 0) > 86400:   # idle refresh tokens die after ~29 days
             for n in slot_names():
                 if n != a: ensure_fresh(load(slot_path(n)), n)
