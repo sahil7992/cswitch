@@ -16,7 +16,7 @@ UCACHE    = os.path.join(ROOT, "usage-cache.json")
 LOG       = os.path.join(ROOT, "cswitch.log")
 LOCK      = os.path.join(ROOT, ".lock")
 CFG_JSON  = os.path.expanduser("~/.claude.json")
-DEFAULTS  = {"threshold": 90, "cache_ttl": 90}
+DEFAULTS  = {"threshold": 90, "last_resort": 98, "cache_ttl": 90}
 
 
 def log(msg):
@@ -275,9 +275,12 @@ def cmd_auto(_=None, quiet=False):
     if au < th:
         if not quiet: print(f"'{a}' at {au:.0f}% - under {th}%, staying")
         return False
-    best, d = pick(a, th)
+    best, d = pick(a, th); lr = st["last_resort"]
+    if best is None and au >= lr:   # every account is past the threshold: run each down to last_resort
+        best, d = pick(a, lr)
     if best is None:
-        if not quiet: print(f"every other account is at {th}% or more - staying on '{a}'")
+        if not quiet: print(f"every other account is at {th}% or more - staying on '{a}' until {lr}%" if au < lr
+                            else f"every account is at {lr}% or more - staying on '{a}'")
         return False
     cmd_use(best, quiet=True)
     msg = f"account rotated: {a} ({au:.0f}% used) -> {best} (weekly {d['seven_day']:.0f}%, session {d['five_hour']:.0f}%)"

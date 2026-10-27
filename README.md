@@ -103,8 +103,12 @@ There is no rate limit event to hook into, so `cswitch` checks on the way in. Th
 `UserPromptSubmit` hook reads the active account's usage, and if it is past the
 threshold on either the 5 hour or the weekly window, it rotates to the saved account
 with the lowest weekly usage, then the lowest 5 hour usage, then whichever comes first
-in `cswitch ls`. Accounts already past the threshold are skipped, and if every other
-account is, it stays where it is.
+in `cswitch ls`. Accounts already past the threshold are skipped.
+
+If every other account is past the threshold too, it keeps going on the active one until
+it reaches `last_resort` (98 percent by default), then rotates to the account still under
+98 with the lowest weekly usage, then the lowest 5 hour usage. When every account is at 98
+or more, it stays where it is.
 
 It fires before your prompt is sent, so the swap lands on the request that would
 otherwise have failed. Checks are cached for 90 seconds, so the common case costs
@@ -126,7 +130,7 @@ never see the wall.
 | `cswitch sync` | Write the live token back to its slot |
 | `cswitch hook install` | Register the auto rotation hook |
 | `cswitch hook uninstall` | Remove it |
-| `cswitch set threshold=85` | Tune `threshold` or `cache_ttl` |
+| `cswitch set threshold=85` | Tune `threshold`, `last_resort` or `cache_ttl` |
 
 ## Security
 
